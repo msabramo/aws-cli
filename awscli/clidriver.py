@@ -10,6 +10,7 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+import subprocess
 import sys
 import signal
 import logging
@@ -183,45 +184,70 @@ class CLIDriver(object):
         """
         if args is None:
             args = sys.argv[1:]
-        command_table = self._get_command_table()
-        parser = self._create_parser(command_table)
-        self._add_aliases(command_table, parser)
-        parsed_args, remaining = parser.parse_known_args(args)
-        try:
-            # Because _handle_top_level_args emits events, it's possible
-            # that exceptions can be raised, which should have the same
-            # general exception handling logic as calling into the
-            # command table.  This is why it's in the try/except clause.
-            self._handle_top_level_args(parsed_args)
-            self._emit_session_event()
-            return command_table[parsed_args.command](remaining, parsed_args)
-        except UnknownArgumentError as e:
-            sys.stderr.write("usage: %s\n" % USAGE)
-            sys.stderr.write(str(e))
-            sys.stderr.write("\n")
-            return 255
-        except NoRegionError as e:
-            msg = ('%s You can also configure your region by running '
-                   '"aws configure".' % e)
-            self._show_error(msg)
-            return 255
-        except NoCredentialsError as e:
-            msg = ('%s. You can configure credentials by running '
-                   '"aws configure".' % e)
-            self._show_error(msg)
-            return 255
-        except KeyboardInterrupt:
-            # Shell standard for signals that terminate
-            # the process is to return 128 + signum, in this case
-            # SIGINT=2, so we'll have an RC of 130.
-            sys.stdout.write("\n")
-            return 128 + signal.SIGINT
-        except Exception as e:
-            LOG.debug("Exception caught in main()", exc_info=True)
-            LOG.debug("Exiting with rc 255")
-            sys.stderr.write("\n")
-            sys.stderr.write("%s\n" % e)
-            return 255
+        num_tries = 0
+        max_num_tries = 2
+
+        while num_tries < max_num_tries:
+            command_table = self._get_command_table()
+            parser = self._create_parser(command_table)
+            self._add_aliases(command_table, parser)
+            parsed_args, remaining = parser.parse_known_args(args)
+
+            try:
+                # Because _handle_top_level_args emits events, it's possible
+                # that exceptions can be raised, which should have the same
+                # general exception handling logic as calling into the
+                # command table.  This is why it's in the try/except clause.
+                self._handle_top_level_args(parsed_args)
+                self._emit_session_event()
+                return command_table[parsed_args.command](remaining, parsed_args)
+            except UnknownArgumentError as e:
+                sys.stderr.write("usage: %s\n" % USAGE)
+                sys.stderr.write(str(e))
+                sys.stderr.write("\n")
+                return 255
+            except NoRegionError as e:
+                msg = ('%s You can also configure your region by running '
+                       '"aws configure".' % e)
+                self._show_error(msg)
+                return 255
+            except NoCredentialsError as e:
+                msg = ('%s. You can configure credentials by running '
+                       '"aws configure".' % e)
+                self._show_error(msg)
+                return 255
+            except KeyboardInterrupt:
+                # Shell standard for signals that terminate
+                # the process is to return 128 + signum, in this case
+                # SIGINT=2, so we'll have an RC of 130.
+                sys.stdout.write("\n")
+                return 128 + signal.SIGINT
+            except botocore.exceptions.ClientError as e:
+                if 'The security token included in the request is expired' in str(e):
+                    num_tries += 1
+                    if num_tries >= max_num_tries:
+                        raise
+                    config = self.session.full_config
+                    default = config.get('profiles', {}).get('default', {})
+                    get_token_command = default.get('get_token_command')
+                    if not get_token_command:
+                        raise
+                    msg = ('Expired security token; '
+                           'Executing get_token_command: '
+                           '\"%s\"' % get_token_command)
+                    self._show_error(msg)
+                    ret = subprocess.call(get_token_command, shell=True)
+                    if ret == 0:
+                        # Fall through so that while loop iterates again and command gets retried
+                        pass
+                    else:
+                        raise
+            except Exception as e:
+                LOG.debug("Exception caught in main()", exc_info=True)
+                LOG.debug("Exiting with rc 255")
+                sys.stderr.write("\n")
+                sys.stderr.write("%s\n" % e)
+                return 255
 
     def _emit_session_event(self):
         # This event is guaranteed to run after the session has been
